@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    # 用空的 HOME 跑一遍：新电脑上没有任何记录时也不能报错
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile tokens.1m.py
+      - name: Menu output (empty home)
+        run: |
+          export HOME="$(mktemp -d)"
+          python tokens.1m.py | tee out.txt
+          head -1 out.txt | grep -q '|'
+      - name: Report (empty home)
+        run: |
+          export HOME="$(mktemp -d)"
+          python tokens.1m.py --report --no-open
+          test -s "$HOME/.token-meter/report.html"
