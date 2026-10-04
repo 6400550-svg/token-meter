@@ -1250,7 +1250,9 @@ def main():
             if done and at:
                 line(f"{what} {datetime.fromtimestamp(at):%H:%M} 已重置，App 下次记录后显示新数字", size=11, color="#888888")
     else:
-        line("没找到 App 的额度记录，打开一次 Claude 桌面 App", size=11, color="#e6a23c")
+        if api.get("err"):
+            line(f"官方接口暂时查不到：{api['err']}", size=11, color="#e6a23c")
+        line("也没找到 Claude 桌面 App 的额度记录", size=11, color="#e6a23c")
     if cxq:
         codex_quota_lines(cxq, now, cache)
     line("---")
