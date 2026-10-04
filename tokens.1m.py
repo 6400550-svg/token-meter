@@ -18,6 +18,8 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -569,6 +571,118 @@ except (KeyError, ValueError, AttributeError):
     WEEKLY_ANCHOR = None  # 没设置：本周累计改按最近 7 天算，不显示重置时间
 
 
+# ---------- Claude 官方额度：直接向 Anthropic 查 ----------
+# 和 Code 标签页里「Plan usage limits」面板同一个数据源。每 2 分钟最多查一次；被限流就按服务器给的时间暂停。
+# 登录凭据：桌面 App 启动 Claude Code 时通过环境变量交给它；终端版的在钥匙串里。只在内存里用，不写盘、不显示。
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_FILE = STATE_DIR / "claude-usage.json"
+USAGE_EVERY = 120
+
+
+def claude_token(st, now):
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
+        pids = [ln.split()[0] for ln in out.splitlines() if re.search(r"/claude\.app/Contents/MacOS/claude(\s|$)", ln)]
+        for pid in reversed(pids):  # 后启动的进程拿到的凭据更新
+            env = subprocess.run(["ps", "eww", "-o", "command=", "-p", pid], capture_output=True, text=True, timeout=5).stdout
+            m = re.search(r"(?:^|\s)CLAUDE_CODE_OAUTH_TOKEN=(\S+)", env)
+            if m:
+                return m.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if now < st.get("kc_skip", 0):
+        return None
+    try:  # 终端版 Claude Code：钥匙串（第一次会弹授权窗口）
+        raw = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                             capture_output=True, text=True, timeout=30).stdout
+        o = json.loads(raw)["claudeAiOauth"]
+        if (o.get("expiresAt") or 0) / 1000 > now + 60:
+            return o["accessToken"]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        pass
+    st["kc_skip"] = now + 6 * 3600  # 钥匙串里没有可用的：6 小时内别再问
+    return None
+
+
+def iso_or_none(s):
+    t = iso_ts(s) if isinstance(s, str) else None
+    return round(t / 60) * 60 if t else None  # 接口给的是 21:59:59.8 这种，取整到分钟
+
+
+def claude_usage(now, fetch=True):
+    """读缓存；到时间了就向 Anthropic 查一次。返回 {t: 查到的时刻, d: {fh, fh_r, sd, sd_r, scoped}, err, h: 历史}"""
+    try:
+        st = json.loads(USAGE_FILE.read_text())
+    except (OSError, ValueError):
+        st = {}
+    if not fetch or now < st.get("next", 0):
+        return st
+    st["next"] = now + USAGE_EVERY
+    tok = claude_token(st, now)
+    if not tok:
+        st["err"] = "没找到登录凭据（Claude 桌面 App 或 Claude Code 没在运行）"
+    else:
+        req = urllib.request.Request(USAGE_URL, headers={"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20",
+                                                         "Accept": "application/json", "User-Agent": "token-meter"})
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                raw = json.load(r)
+            fh, sd = raw.get("five_hour") or {}, raw.get("seven_day") or {}
+            scoped = []
+            for lim in raw.get("limits") or []:
+                name = (((lim.get("scope") or {}).get("model") or {}).get("display_name"))
+                if lim.get("kind") == "weekly_scoped" and name and lim.get("percent") is not None:
+                    scoped.append([name, lim["percent"], iso_or_none(lim.get("resets_at"))])
+            d = {"fh": fh.get("utilization"), "fh_r": iso_or_none(fh.get("resets_at")),
+                 "sd": sd.get("utilization"), "sd_r": iso_or_none(sd.get("resets_at")), "scoped": scoped}
+            st.update(t=now, d=d, err=None)
+            h = [x for x in st.get("h", []) if x[0] >= now - 10 * 86400]
+            if not h or h[-1][1:] != [d["fh"], d["sd"]] or now - h[-1][0] > 1800:
+                h.append([now, d["fh"], d["sd"]])
+            st["h"] = h
+        except urllib.error.HTTPError as e:
+            ra = e.headers.get("retry-after") or ""
+            if e.code == 429:
+                st["next"] = now + max(USAGE_EVERY, int(ra) if ra.isdigit() else 1200)
+                st["err"] = f"被限流，{fmt_dur(st['next'] - now)}后再查"
+            else:
+                st["err"] = "登录凭据失效，等 Claude Code 换新凭据" if e.code in (401, 403) else f"接口返回 {e.code}"
+        except (urllib.error.URLError, OSError, ValueError):
+            st["err"] = "网络不通"
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        tmp = USAGE_FILE.with_name(f"claude-usage.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(st))
+        tmp.replace(USAGE_FILE)
+    except OSError:
+        pass
+    return st
+
+
+APP_LOG = HOME / "Library/Logs/Claude/main.log"
+
+
+def app_poll_paused():
+    """新版桌面 App（2026-09-30 起）只有在 24 小时内右键打开过它菜单栏图标的额度菜单，才在后台记额度
+    （左键是快速输入，不算）。
+    看日志里最后一条 [plan-usage] 是不是「已暂停」。"""
+    step, limit = 1 << 20, 32 << 20  # 从文件尾往前每次读 1 MB，最多 32 MB
+    try:
+        with open(APP_LOG, "rb") as f:
+            end = f.seek(0, 2)
+            pos = end
+            while pos > 0 and end - pos < limit:
+                pos = max(0, pos - step)
+                f.seek(pos)
+                chunk = f.read(min(step + 4096, end - pos))  # 多读一点，免得切断跨块的那一行
+                hits = [ln for ln in chunk.split(b"\n") if b"[plan-usage]" in ln]
+                if hits:
+                    return b"background poll paused" in hits[-1]
+    except OSError:
+        pass
+    return False
+
+
 def read_plan_history():
     try:
         d = json.loads(PLAN_HISTORY.read_text())
@@ -830,7 +944,8 @@ def week_section(recs, sd, now, cache):
 def fmt_reset(t, now):
     d = datetime.fromtimestamp(t)
     left = fmt_dur(t - now) if t - now < 86400 else f"{(t - now) / 86400:.1f} 天"
-    day = "" if d.date() == datetime.fromtimestamp(now).date() else f"周{'一二三四五六日'[d.weekday()]} "
+    gap = (d.date() - datetime.fromtimestamp(now).date()).days
+    day = "" if gap == 0 else "明天 " if gap == 1 else f"周{'一二三四五六日'[d.weekday()]} "
     return f"{day}{d:%H:%M} 重置（{left}）"
 
 
@@ -1050,17 +1165,30 @@ def main():
     wins = windows(claude)
     cur = wins[-1] if wins and now < wins[-1][0] + WINDOW else None
 
-    samples = read_plan_history()
+    global WEEKLY_ANCHOR
+    api = claude_usage(now)
+    live = api.get("d") if api.get("d") and now - api.get("t", 0) < 20 * 60 else None
+    if live and live.get("sd_r"):
+        WEEKLY_ANCHOR = live["sd_r"]  # 官方的每周重置时刻，比 config 里填的准
+    # App 的记录 + 自己查到的历史，合在一起给走势图和「今天」用
+    samples = sorted(read_plan_history() + [(t, {"fh": a, "sd": b}) for t, a, b in api.get("h", [])], key=lambda x: x[0])
     last = samples[-1] if samples else None
     age = now - last[0] if last else None
     stale = age is not None and age > 20 * 60
     fh = last[1].get("fh") if last else None
     sd = last[1].get("sd") if last else None
+    if live:
+        fh, sd, stale, age = live["fh"], live["sd"], False, now - api["t"]
+        last = (api["t"], {"fh": fh, "sd": sd})
+        fh = None if fh is None else round(fh)
+        sd = None if sd is None else round(sd)
     # App 每 15 分钟才记一次。最近一次记录如果早于最近一次重置，它记的是上一个窗口的数，
     # 当前窗口按 0% 显示，等 App 下次记录再更新。
     # 最近一次 5 小时重置 = 当前窗口的起点；空闲时 = 上一个窗口的结束
     fh_reset_at = cur[0] if cur else (wins[-1][0] + WINDOW if wins else None)
-    fh_reset = fh is not None and ((fh_reset_at is not None and last[0] < fh_reset_at) or (not cur and age > WINDOW))
+    if live and live.get("fh_r"):
+        fh_reset_at = live["fh_r"] - WINDOW
+    fh_reset = fh is not None and ((fh_reset_at is not None and last[0] < fh_reset_at) or (not cur and not live and age > WINDOW))
     if fh_reset:
         fh = 0
     wr_now = next_weekly_reset(now)
@@ -1094,9 +1222,10 @@ def main():
     # --- 官方额度 ---
     line("Claude 官方额度", sfimage="checkmark.seal", size=13)
     if fh is not None:
-        when = f"{datetime.fromtimestamp(cur[0] + WINDOW):%H:%M} 重置（{fmt_dur(cur[0] + WINDOW - now)}）" if cur else "空闲中"
+        fh_end = live["fh_r"] if live and live.get("fh_r") else (cur[0] + WINDOW if cur else None)
+        when = fmt_reset(fh_end, now) if fh_end and fh_end > now else "空闲中"
         line(f"5 小时   {bar(fh, 14)} {fh:>3}%  {when}", **_f(), **({"color": level_color(fh)} if level_color(fh) else {}))
-        recent = [u.get("fh", 0) for t, u in samples if cur and t >= cur[0]]
+        recent = [u.get("fh") or 0 for t, u in samples if fh_reset_at and t >= fh_reset_at]
         if len(recent) >= 2:
             line(f"         {spark(recent)}  本窗口走势", **_f(), color="#888888")
     if sd is not None:
@@ -1106,9 +1235,17 @@ def main():
         if wr:
             spent = sum(cost(r) for r in claude if r[0] >= wr - WEEK)
             daily_lines(sd, wr - WEEK, wr, now, claude_used_at(samples, claude, wr - WEEK, sd), spent / sd if sd else None, lambda x: f"${x:,.0f} API 价")
-    if last:
+    for name, pct, reset in (live or {}).get("scoped", []):
+        lc = level_color(pct)
+        line(f"{pad(name + ' 周', 9)}{bar(pct, 14)} {round(pct):>3}%  {fmt_reset(reset, now) if reset else ''}".rstrip(), **_f(), **({"color": lc} if lc else {}))
+    if live:
+        line(f"来自 Anthropic 官方接口 · {'刚刚' if age < 60 else f'{int(age // 60)} 分钟前'}（每 2 分钟更新）", size=11, color="#888888")
+    elif last:
+        if api.get("err"):
+            line(f"官方接口暂时查不到：{api['err']}，先显示 App 的记录", size=11, color="#e6a23c")
         note = f"{int(age // 60)} 分钟前" if age >= 60 else "刚刚"
-        line(f"来自 Claude App 记录 · {note}" + ("（App 没开时不会更新）" if stale else ""), size=11, color="#e6a23c" if stale else "#888888")
+        paused = stale and app_poll_paused()
+        line(f"来自 Claude App 记录 · {note}" + ("" if not stale else "（App 暂停了记录）" if paused else "（App 没开时不会更新）"), size=11, color="#e6a23c" if stale else "#888888")
         for done, what, at in ((fh_reset and cur, "5 小时额度", fh_reset_at), (sd_reset, "每周额度", wr_now - WEEK if wr_now else None)):
             if done and at:
                 line(f"{what} {datetime.fromtimestamp(at):%H:%M} 已重置，App 下次记录后显示新数字", size=11, color="#888888")
@@ -1183,6 +1320,10 @@ def _f():
 # ---------- 详细报告（HTML） ----------
 
 def write_report():
+    global WEEKLY_ANCHOR
+    api = claude_usage(time.time(), fetch=False)
+    if (api.get("d") or {}).get("sd_r"):
+        WEEKLY_ANCHOR = api["d"]["sd_r"]
     cache, recs = load_all()
     models, projs, efforts, wins = [], [], [], []
     mi, pi, ei, wi = {}, {}, {}, {}
@@ -1248,7 +1389,8 @@ def codex_report_data(cache, now):
 
 
 def read_plan_history_raw():
-    return [[int(t), u.get("fh"), u.get("sd")] for t, u in read_plan_history()]
+    own = [(t, {"fh": a, "sd": b}) for t, a, b in claude_usage(time.time(), fetch=False).get("h", [])]
+    return [[int(t), u.get("fh"), u.get("sd")] for t, u in sorted(read_plan_history() + own, key=lambda x: x[0])]
 
 
 REPORT_HTML = r'''<!doctype html>

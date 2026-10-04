@@ -13,7 +13,7 @@
 ## 能看到什么
 
 **Claude**
-- **官方额度**：5 小时额度、每周额度各用了百分之几，几点重置（来自 Claude 桌面 App 的记录）。快满时菜单栏变黄、变红。
+- **官方额度**：5 小时额度、每周额度（以及 Fable 等单独计的周额度）各用了百分之几，几点重置。每 2 分钟向 Anthropic 查一次，和 Claude App 里「Plan usage limits」面板是同一个数。快满时菜单栏变黄、变红。
 - **今日额度**：周额度平分到 7 天，进度条显示今天已用 / 可用。哪天没用完会累积到下一天，前几天超用了后面就少；还会按你现在的速度预测到重置时会用到多少、会不会提前用完。
 - **本周累计**：一共多少 tokens、按 Anthropic API 单价折合多少钱、是套餐周费的几倍；按模型、按思考强度（max / xhigh / high / medium）、API 价构成（输入 / 输出 / 缓存写 / 缓存读）、每个对话窗口各用了多少。
 - **后台调用也算进去**：标题生成、权限判断这些不写进会话记录的请求，按 Claude Code 每次运行结束时的费用汇总补上。
@@ -53,13 +53,15 @@
 
 ## 数据从哪来 · 隐私
 
-**只在本机读文件，不联网，不上传，没有任何遥测。** 读取的位置：
+**只上传一样东西：** 每 2 分钟向 `api.anthropic.com` 查一次你的 Claude 官方额度（和 Claude App 里额度面板用的是同一个接口），用的是 Claude Code 已登录的凭据——桌面 App 启动 Claude Code 时交给它的，或者终端版 Claude Code 存在钥匙串里的（第一次会弹授权窗口）。凭据只在内存里用，不写盘、不显示、不发给别人。被限流时会按服务器要求暂停；查不到时自动改用 Claude 桌面 App 自己的额度记录。
+
+除此之外**只在本机读文件，不上传任何用量数据，没有遥测**。读取的位置：
 
 | 内容 | 位置 |
 |---|---|
 | Claude Code 会话记录（每条回复的 token 用量） | `~/.claude/projects/**/*.jsonl` |
 | Cowork 会话记录、桌面 App 窗口标题 | `~/Library/Application Support/Claude/` 下的会话目录 |
-| Claude 官方额度（桌面 App 每 15 分钟记一次） | `~/Library/Application Support/Claude/plan-usage-history.json` |
+| Claude 官方额度（查不到接口时的备用：桌面 App 自己的记录） | `~/Library/Application Support/Claude/plan-usage-history.json` |
 | Codex 用量、官方额度、线程标题 | `~/.codex/sessions/**/rollout-*.jsonl`、`~/.codex/session_index.jsonl` |
 
 只解析用量、额度、模型、标题这几类记录，不读对话内容，也不碰登录凭据。统计结果缓存在 `~/.token-meter/`（增量读取，Claude Code 清理掉旧会话后历史仍保留）。
@@ -67,7 +69,7 @@
 ## 说明
 
 - 「API 价」是按 Anthropic 官方 API 单价折算的，用来看用量值多少钱；订阅套餐并不按这个收费。新模型出来时需要更新文件里的 `PRICES`。
-- 官方额度百分比来自 Claude 桌面 App。没装或没开桌面 App 时，菜单栏改为显示今日 token 数，其它本地统计照常。
+- Claude 官方额度需要 Claude 桌面 App 或 Claude Code 在运行（要用它们的登录凭据）。都没开、也没有 App 的记录时，菜单栏改为显示今日 token 数，其它本地统计照常。
 - 思考强度从 2026 年 9 月起才有记录，更早的显示为「未记录」。
 - 只统计本机的 Claude Code（终端、桌面 App 的 Code 页和 Cowork、IDE 插件）和 Codex；网页版 claude.ai / ChatGPT 的聊天不在里面。
 
